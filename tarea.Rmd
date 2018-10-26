@@ -1,0 +1,311 @@
+# Introducción
+
+El presente documento resume un análisis comparativo respecto de las direcciones de productos, provistas por el area de GIS (XYGO) y el departamento de ventas Open Smart Flex (OSF).
+
+- El objetivo es identificar los productos(direcciones) con mayor diferencia entre las direcciones XYGO - OSF, de manera que puedan ser revisadas por las áreas funcionales.
+
+Los datos provienen de una base de datos ORACLE.
+ -  Oracle Database 11g Enterprise Edition Release 11.2.0.4.0 - 64bit Production.
+ 
+#### Componentes de un producto: 
+
+|Descripción      | Dato     |  
+|:----------------|---------:| 
+|Identificador del producto|XYGO_PRODUCT_ID|   
+|La dirección registrada en el proceso de venta (OSF)|OSF_ADDRESS|    
+|La dirección entregada por área GIS (hipótesis de que XYGO sea la CORRECTA) |XYGO_ADDRESS|
+|Nombre de calle entregado por área GIS |XYGO_WAY_NAME | 
+|El N° de calle entregado por área GIS |XYGO_WAY_NUMBER | 
+|Latitud |LAT| 
+|Longitud |LON| 
+|Variable binaria 0,1|SCORE_A| 
+|Variable binaria 0,1|SCORE_B|  
+
+
+
+![Tabla del sistema.](C:/Users/cvargasa/Desktop/Tarea/XYGO_DIRECCIONES.png)
+ 
+
+```  
+SELECT      
+		XYGO_PRODUCT_ID,   
+		LAT,
+		LON,
+		XYGO_WAY_NUMBER,
+		XYGO_WAY_NAME, 
+		XYGO_ADDRESS, 						-- dirección sistema A (hipótesis de que XYGO sea la CORRECTA)
+		AB_ADDRESS.ADDRESS "OSF_ADDRESS", 	-- dirección sistema B (OSF) 
+CASE WHEN trim(XYGO_ADDRESS) = trim(AB_ADDRESS.ADDRESS) THEN 1 ELSE 0 end SCORE_A,
+CASE WHEN AB_ADDRESS.ADDRESS LIKE '%'||XYGO_WAY_NUMBER||'%' THEN 1 ELSE 0 end SCORE_B  
+FROM SFINTERFAZ.XYGO_DIRECCIONES
+JOIN CHILQUIN.PR_PRODUCT@SFAA ON PR_PRODUCT.PRODUCT_ID = XYGO_DIRECCIONES.XYGO_PRODUCT_ID
+JOIN CHILQUIN.AB_ADDRESS@SFAA ON AB_ADDRESS.ADDRESS_ID = PR_PRODUCT.ADDRESS_ID
+```
+
+
+####  Carga de librerias en R:
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#install.packages("sparklyr")
+#install.packages("dplyr")  
+#install.packages("ggplot2")
+#install.packages("knitr")#tablas
+#install.packages("ggplot2")
+#install.packages("scales") # funcion de %
+#install.packages("readr")
+#install.packages("sp") 
+#install.packages("leaflet")
+#install.packages("plyr") 
+library(sparklyr)
+library(dplyr)  
+library(ggplot2)
+library(knitr)#tablas
+library(ggplot2)
+library(scales) # funcion de %
+library(readr)
+library(sp) 
+library(leaflet)
+library(plyr)
+```
+ 
+```{r Conexión a Spark R, include=FALSE}
+# Limpia memoria R
+rm(list=ls())
+# Especifica el working directory
+setwd("C:/Users/cvargasa/Desktop/Tarea")  
+sc <- spark_connect( master = "local" ) 
+ 
+```
+ Luego de extraer los datos a un archivo csv  estos son cargados a R con Spark
+```{r Carga de Datos, message=TRUE, warning=TRUE, include=FALSE, paged.print=TRUE}
+direcciones = spark_read_csv(sc, name = "direcciones", path = "XYGO_DIRECCIONES.csv" ,delimiter = ";")
+
+head(direcciones)
+
+
+#direcciones = spark_read_parquet(sc,"direcciones", file.path("XYGO_DIRECCIONES"))
+#spark_write_csv(direcciones, file.path("direcciones"),mode='overwrite'  , delimiter = ";")
+ 
+#match = spark_read_csv(  sc,  name = "direcciones",  path = 'XYGO_DIRECCIONES.csv', header = T,  infer_schema = T, delimiter = ";",  overwrite = T  ) 
+```
+  
+## Normalizacion de direcciones XYGO Y OSF
+Como se menciona la normalizacion de palabras involucra remover espacios antes y despues de un texto  , los acentos , caracteres especiales , ademas de convertir a mayuscula o minuscula todas la palabras para minimizar la diferencia al momento de comparar. <br>
+
+Se crearan nuevas columnas con las direcciones normalizadas agregandoles el sufijo _CLEAN.
+
+
+
+```{r}
+## Cargamos los datos en memoria R
+data = direcciones %>% collect()
+  
+## Removemos
+## Dobles espacios  
+data$XYGO_ADDRESS_CLEAN     =  gsub("[[:punct:]]", " ",  data$XYGO_ADDRESS)
+data$XYGO_WAY_NAME_CLEAN    =  gsub("[[:punct:]]", " ",  data$XYGO_WAY_NAME)
+data$OSF_ADDRESS_CLEAN            =  gsub("[[:punct:]]", " ",  data$OSF_ADDRESS)
+
+## Caracteres no alfanumericos ;!
+data$XYGO_ADDRESS_CLEAN     =  gsub("[^[:alnum:]///' ]", " ", data$XYGO_ADDRESS_CLEAN)
+data$XYGO_WAY_NAME_CLEAN    =  gsub("[^[:alnum:]///' ]", " ", data$XYGO_WAY_NAME_CLEAN)
+data$OSF_ADDRESS_CLEAN            =  gsub("[^[:alnum:]///' ]", " ", data$OSF_ADDRESS_CLEAN)
+
+## Caracteres especiales
+data$XYGO_ADDRESS_CLEAN     =  gsub("[^[:alnum:]///' ]+^ *|(?<= ) | *$", "", data$XYGO_ADDRESS_CLEAN, perl = TRUE)
+data$XYGO_WAY_NAME_CLEAN    =  gsub("[^[:alnum:]///' ]+^ *|(?<= ) | *$", "", data$XYGO_WAY_NAME_CLEAN, perl = TRUE)
+data$OSF_ADDRESS_CLEAN            =  gsub("[^[:alnum:]///' ]+^ *|(?<= ) | *$", "", data$OSF_ADDRESS_CLEAN, perl = TRUE)
+ 
+```
+
+## Creación del diccionario de palabras
+- Cada columna dirección se convierte a un vector de string.
+- Luego se extraen las 300 palabras más repetidas para analizarlas por separado , el paquete qdap automatiza este paso.
+- Se genera un diccionario .csv con las palabras finales.
+- Se Limpian las columnas _CLEAN con el diccionario.
+ 
+ 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+   
+vector_string = paste( toString(data$XYGO_WAY_NAME_CLEAN) ,
+                       toString(data$XYGO_ADDRESS_CLEAN)  ,
+                       toString(data$OSF_ADDRESS_CLEAN), 
+                       sep=",")  
+ 
+```
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE} 
+library(qdap)
+top_words <- freq_terms( vector_string , 300 ) 
+```
+## Exportamos el listado de palabras para crear el  diccionario.
+La función csv2 permite exportar declarando el nombre del archivo y su variable con los datos, a un archivo csv   , hay que tener en cuenta que sobreecribe los archivos ya creados.
+```{r}  
+write.csv2(top_words, file ="top_words.csv"  , row.names = FALSE  )
+```
+## Gráfico con las 30 palabras más repetidas
+```{r message=FALSE, warning=FALSE}
+top_30 <- freq_terms( vector_string , 30 ) 
+
+# SE ORDENAN DE MAYOR A MENOR
+top_30$WORD <- factor(top_30$WORD, levels = top_30$WORD[order(top_30$FREQ)])
+
+# desabilita la notacion científica para los ejes
+options(scipen=10000)
+
+# historigrama
+ggplot(data = top_30) +
+  aes(x = WORD, weight = FREQ) +
+  #geom_bar(fill = "#6baed6") +
+    geom_histogram(bins = 30, fill = "#0c4c8a" , stat="count")+
+  theme_minimal() +
+  labs(title = "Top 30 palabras más repetidas",
+    y = "Frecuencia",
+    x = "Palabra") +
+    # gira los ejes para mejor lectura
+  coord_flip()  
+
+```
+```{r}
+head(top_30)
+```
+
+ Como previamente se ha creado un diccionario.csv,  trabajaremos las columnas con estos datos.
+ La paquete de text mining (tm) ayudará en esta etapa eliminando las palabras seleccionadas de las direcciones
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#cargamos el csv
+dicc = spark_read_csv(sc, name = "dicc", path = "diccionario.csv" ,delimiter = ";")
+df = dicc %>% collect()
+
+# convertimos a mayusculas el diccionario
+df$diccionario = toupper( df$diccionario )
+  
+library(tm)
+data$XYGO_ADDRESS_CLEAN     =  removeWords(data$XYGO_ADDRESS_CLEAN,df$diccionario)      
+data$OSF_ADDRESS_CLEAN      =  removeWords(data$OSF_ADDRESS_CLEAN,df$diccionario) 
+#data$XYGO_WAY_NAME_CLEAN    =  removeWords(data$XYGO_WAY_NAME_CLEAN,df$diccionario) 
+
+ 
+## Removemos
+## Dobles espacios  
+data$XYGO_ADDRESS_CLEAN     =  gsub("[[:punct:]]", " ",  data$XYGO_ADDRESS_CLEAN) 
+data$OSF_ADDRESS_CLEAN      =  gsub("[[:punct:]]", " ",  data$OSF_ADDRESS_CLEAN)
+  
+```
+## Comparando direcciones.
+Se crea una nueva variable con la distancia de levenshtein ,  este algoritmo fue propuesto por Vladimir Levenshtein en 1965 y ahora esta disponible en PHP, SQL  y el paquete RecordLinkage de R .<br>
+Su función es  determinar el grado de similaridad entre dos cadenas de caracteres, para ello calcula el numero mínimo de movimientos para tranformar una cadena a otra.<br>
+ 
+ Por ejemplo, la distancia de Levenshtein entre "casa" y "calle" es de 3 porque se necesitan al menos tres ediciones elementales para cambiar uno en el otro.
+
+- casa → cala (sustitución de 's' por 'l')
+- cala → calla (inserción de 'l' entre 'l' y 'a')
+- calla → calle (sustitución de 'a' por 'e')
+
+Dentro del paquete de R esta funcion permite obtener ademas un % de similaridad con la funcion levenshteinDist la cual ocuparemos , con unos cambios mínimos.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(RecordLinkage)
+
+# además se debio crear una función auxiliar para que pudiece ejecutarse con la sentencia mutate
+matching = function( str1, str2 ){  
+    return( 1 - (levenshteinDist(str1, str2) / pmax(nchar(str1) , nchar(str2) ))) 
+}  
+ 
+data$CLEAN_C=NULL
+
+# mutate agrega una nueva columna denominada CLEAN_C con % de comparación
+data = data %>% 
+  mutate( CLEAN_C = matching( XYGO_ADDRESS_CLEAN, OSF_ADDRESS_CLEAN ) )  
+  ##mutate( CLEAN_D = matching( XYGO_WAY_NAME_CLEAN, ADDRESS_CLEAN ) ) 
+  
+
+```
+
+
+# Clasificando los resultados
+
+Percentiles 80 y 50 (0.982 , 0.958 )
+ 
+```{r}
+psup = quantile( data$CLEAN_C, 0.8)
+pinf = quantile( data$CLEAN_C, 0.5)  
+  
+data = data %>% 
+mutate( MATCH =  
+            case_when(
+                ( SCORE_A == 1   ) ~ "a. Total", 
+                ( SCORE_A == 0   ) ~ 
+                        case_when(
+                            ( CLEAN_C >= psup ) ~ 
+                                ifelse( SCORE_B == 1 , "b. Muy Alta" , "c. Alta" ),
+                            
+                            ( CLEAN_C  >= pinf  ) ~
+                                ifelse( SCORE_B == 1 , "c. Alta" , "d. Media" ) ,
+                            
+                            ( CLEAN_C < pinf ) ~ 
+                                ifelse( SCORE_B == 1 , "d. Media" , "e. Baja" ) ,
+                            
+                            TRUE ~ "f. Indefinida"
+                        ) 
+            )
+)
+```
+
+
+
+```{r}
+df =  data %>%  
+          group_by(MATCH) %>% 
+          dplyr::summarise(n = n()) %>% 
+          ungroup() %>%  
+          mutate( per  = round(  (n / sum( n , na.rm = TRUE ))  , 2) )
+ 
+pie <- ggplot(df, aes( x = "", y=n, fill = factor(MATCH))) +  
+  geom_bar(width = 1, stat = "identity") +
+  theme(axis.line = element_blank(), 
+        axis.text = element_blank(), 
+        plot.title = element_text(hjust=0.5),
+        panel.background = element_rect(fill = "white", colour = "white")) +  
+  labs(fill="Coincidencia", x=NULL,  y=NULL,  
+       title="Clasificación según Estimadores de Coincidencia" ) + 
+  geom_text(aes(label = percent(df$per)), position = position_stack(vjust = 0.5)) +
+  scale_fill_brewer( palette = "Reds")
+pie + coord_polar(theta = "y", start=0)  
+
+kable(df , caption = "Clasificación según Estimadores de Coincidencia" , col.names = c("Coincidencia", "Registros", "Porcentaje"))
+```
+
+
+
+
+## Ejemplos de Direcciones según Clasificación
+Se realiza muestreo de 3 direcciones por Clasificación para ser revisadas.
+```{r Ejemplos, echo=FALSE, message=FALSE}
+
+segs = unique(data$MATCH)
+idsample = list()
+
+for(i in 1:length(segs)){
+  idsubsample = data.frame(id=which(data$MATCH==segs[i]))
+  idsample[[i]] = sample(idsubsample$id,3)
+ }
+ 
+Tsample <- data[unlist(idsample),]
+Tsample <- Tsample %>% 
+          arrange(MATCH) %>%
+          select(XYGO_PRODUCT_ID, XYGO_ADDRESS_CLEAN, OSF_ADDRESS_CLEAN, MATCH , CLEAN_C)
+kable(Tsample, caption = "Ejemplos según Clasificación" , col.names = c("Producto - NIS", "Dirección XYGO", "Dirección OSF","Coincidencia" , "%"))
+
+#levenshteinSim("RENE AHUMADA 7","ENCON PALOMAR 8")
+```
+
+
+## Exportamos a parquet por medio de Spark
+```{r}
+#se cargan los datoa a Spark 
+#cleandata = copy_to(sc , data , 'direcciones_clean' , overwrite = T) 
+#spark_write_parquet(cleandata, file.path("direcciones_clean") , mode='overwrite') 
+```
+ 
+
